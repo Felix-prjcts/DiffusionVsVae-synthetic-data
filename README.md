@@ -1,80 +1,56 @@
-# Données tabulaires synthétiques : un modèle de diffusion face à un VAE
+# Diffusion vs VAE sur des données tabulaires
 
-Ce projet part d'une question simple. Si l'on entraîne un modèle sur des données générées plutôt que sur des données réelles, que perd-on ? Et les métriques qui mesurent la ressemblance entre données synthétiques et réelles disent-elles quelque chose de cette perte ?
+Projet perso pour apprendre à coder un modèle de diffusion (DDPM, Ho et al. 2020) et voir ce qu'il vaut sur des tableaux de données.
 
-Pour y répondre, je compare deux générateurs sur deux jeux de données tabulaires :
+La question de départ : si on entraîne un modèle sur des données générées au lieu de vraies données, on perd combien ? Et est-ce que les données qui ressemblent le plus aux vraies sont aussi celles qui servent le plus ?
 
-- un modèle de diffusion (DDPM, Ho, Jain et Abbeel, 2020) adapté aux tableaux, que j'implémente moi-même ;
-- un VAE conditionnel, qui sert de point de comparaison.
+Je compare deux générateurs :
 
-Ce qui m'intéresse le plus, c'est de savoir si le générateur dont les données sont les plus utiles est aussi celui dont les données ressemblent le plus aux vraies. Rien ne garantit que ce soit le cas.
+- un DDPM codé à la main en PyTorch ;
+- un VAE, plus classique, comme point de comparaison.
 
-*Projet en cours : les résultats seront ajoutés au fil de l'avancement.*
+## Les données
 
-## Données
+J'ai pris deux jeux sans variables catégorielles, pour rester simple.
 
-| | California Housing | MAGIC Gamma Telescope |
-|---|---|---|
-| Domaine | immobilier (recensement américain de 1990) | astrophysique (événements simulés d'un télescope Tcherenkov) |
-| Tâche | régression : valeur médiane des logements d'un quartier | classification : gamma ou hadron |
-| Lignes | 20 640 | 18 905 (19 020 avant dédoublonnage) |
-| Variables | 8, toutes continues | 10, toutes continues |
-| Source | scikit-learn | OpenML, identifiant 1120 |
+- California Housing (scikit-learn) : 20 640 quartiers, 8 variables. On prédit le prix médian des logements.
+- MAGIC Gamma Telescope (OpenML, id 1120) : 18 905 événements après suppression de 115 doublons, 10 variables. On prédit si c'est un rayon gamma ou un hadron (65 % / 35 %).
 
-J'ai choisi deux jeux sans variables catégorielles. C'est un choix de périmètre pour tenir dans le temps imparti, pas une propriété des méthodes.
+Deux choses à savoir sur California. `HouseAge` est plafonné à 52 ans et le prix à 500 000 $, et environ 5 % des lignes sont pile au plafond. La carte des logements a aussi deux gros pôles, Los Angeles et la baie de San Francisco. C'est pratique pour vérifier un générateur : s'il lisse tout vers la moyenne, la carte devient une tache.
 
-Quelques particularités comptent pour la suite.
+## Comment je m'y prends
 
-- **Deux colonnes plafonnées dans California.** `HouseAge` est plafonné à 52 ans (6,2 % des lignes) et la cible à 5,00001, soit 500 000 $ (4,7 %). Ces valeurs veulent dire « au moins », mais je les garde telles quelles : un bon générateur doit reproduire ces pics.
-- **Une géographie bimodale.** La latitude et la longitude de California se concentrent autour de Los Angeles et de la baie de San Francisco. La carte des logements sert de test visuel : un générateur qui lisse vers la moyenne la transforme en tache floue.
-- **MAGIC.** Le jeu contenait 115 doublons exacts, retirés avant le découpage. Ses variables ont des queues lourdes, et les classes sont déséquilibrées (65 % gamma, 35 % hadron).
+J'ai fixé ces règles avant d'avoir le moindre résultat.
 
-## Protocole
+Chaque jeu est coupé une fois pour toutes en train, validation et test (70 / 15 / 15, graine 0). Tous les réglages se font sur la validation, et le test ne sert qu'à la fin.
 
-J'ai fixé les règles ci-dessous avant de voir le moindre résultat. Si je dois m'en écarter, je l'indiquerai dans la section Limites, avec la raison.
+Avant d'entrer dans les générateurs, chaque colonne est ramenée à une loi normale avec un `QuantileTransformer` ajusté sur le train. J'ajoute un bruit minuscule juste avant, sinon toutes les valeurs au plafond se retrouvent empilées au même point. Les données générées repassent par la transformation inverse, donc tout est évalué dans les vraies unités.
 
-**Découpage.** Chaque jeu est coupé une seule fois en train (70 %), validation (15 %) et test (15 %), avec une graine fixe. Le découpage est stratifié sur la classe pour MAGIC, et sur les déciles de la cible pour California. Le train sert à entraîner les générateurs et les modèles, la validation à tous les réglages. Le test n'est ouvert qu'une fois, pour les chiffres finaux.
+Pour la cible, je fais comme TabDDPM. Pour California, le prix est généré avec les autres colonnes. Pour MAGIC, on tire la classe dans les proportions du train, et le modèle génère les variables sachant la classe.
 
-**Prétraitement des générateurs.** Les deux générateurs voient exactement les mêmes données. Chaque colonne est ramenée vers une loi normale par une transformation par quantiles, ajustée sur le train uniquement. J'ajoute avant la transformation un bruit négligeable (de l'ordre de 10⁻⁶ écart-type) pour départager les valeurs répétées. Sans lui, toutes les valeurs plafonnées seraient envoyées au même point, à l'extrémité de la gaussienne. Les données générées repassent par la transformation inverse : toute l'évaluation se fait en unités d'origine.
+Sur un même jeu, diffusion et VAE suivent le même schéma. Ils ont à peu près le même nombre de paramètres (environ 140 000), le même nombre d'itérations et génèrent le même nombre de lignes. Je m'autorise au plus trois réglages par générateur, choisis sur California puis appliqués tels quels à MAGIC.
 
-**Conditionnement.** Les deux générateurs produisent des lignes conditionnellement à la cible. Pour fabriquer un jeu synthétique, je tire d'abord les valeurs de la cible dans leur distribution observée sur le train, puis je génère les variables explicatives correspondantes.
+Le DDPM suit le papier : calendrier de bruit linéaire (β de 1e-4 à 0,02, T = 1000), un réseau qui prédit le bruit ajouté, la perte simplifiée, puis la génération en 1000 pas. Le papier utilise un U-Net parce qu'il travaille sur des images. Ici c'est un simple MLP de 3 couches de 256. J'ai testé deux façons de donner le pas de temps au réseau : t/T directement, ou l'embedding sinusoïdal du papier.
 
-**Équité de la comparaison.** Les deux générateurs :
+Pour mesurer l'utilité, j'entraîne un gradient boosting et un petit réseau (2 couches de 64) sur les données générées, puis je les teste sur le vrai test : R² pour California, AUC pour MAGIC. Leurs réglages sont fixés une fois sur les vraies données et ne bougent plus.
 
-- ont un nombre de paramètres du même ordre ;
-- reçoivent le même nombre d'itérations d'entraînement ;
-- produisent le même nombre de lignes.
+Je fais aussi une courbe de mélange. À taille fixe, le jeu d'entraînement contient 0, 25, 50, 75 ou 100 % de vraies données, et le reste est généré. Pour la lire, je la compare aux scores obtenus avec la même part de vraies données toute seule.
 
-Chacun a droit à trois configurations au plus, choisies sur la validation de California. Ces réglages sont ensuite appliqués sans retouche à MAGIC, qui joue le rôle de test de robustesse.
+Pour la ressemblance, je regarde les marginales (distance de Wasserstein) et les corrélations (Spearman). Pour la mémorisation, je vérifie que les lignes générées ne sont pas plus proches du train que du test. Si c'était le cas, le modèle recopierait.
 
-**Modèles d'évaluation.** J'utilise un gradient boosting (`HistGradientBoosting` de scikit-learn) et un petit réseau de neurones (deux couches cachées de 64 neurones). Leurs hyperparamètres sont fixés une fois pour toutes sur données réelles. Ils ne changent plus, quelle que soit l'origine des données d'entraînement.
+Pour voir si ressemblance et utilité vont ensemble, je garde des sauvegardes des générateurs tout au long de l'entraînement. Ça donne une vingtaine de points par jeu au lieu de quatre.
 
-**Mesures.**
+Mon intuition de départ : le VAE devrait bien reproduire les corrélations, mais lisser les queues de distribution et les zones à plusieurs modes, comme la carte de Californie.
 
-- *Utilité.* Les modèles d'évaluation sont entraînés sur les données synthétiques et testés sur le test réel (protocole « train on synthetic, test on real »). La référence est le même modèle entraîné sur le train réel. J'utilise le R² pour California et l'AUC pour MAGIC.
-- *Courbe de mélange.* La taille du jeu d'entraînement reste celle du train. La part de données réelles vaut 0, 25, 50, 75 ou 100 %, et le reste est synthétique. Pour lire cette courbe, je la compare aux scores obtenus avec les mêmes parts de réel seul, sans complément. Le générateur ayant vu tout le train, la question est combien de réel on peut remplacer, et non comment augmenter un petit jeu de données.
-- *Ressemblance.* Je compare les marginales (distance de Wasserstein, colonne par colonne) et la structure de dépendance (écart entre matrices de corrélation de Spearman).
-- *Mémorisation.* Pour chaque ligne synthétique, je mesure la distance à la ligne la plus proche du train et à la ligne la plus proche du test. Des lignes synthétiques nettement plus proches du train que du test signaleraient un générateur qui recopie, et donc des scores d'utilité trompeurs.
-- *Lien entre ressemblance et utilité.* Avec deux générateurs, la question n'aurait que quatre points. Je sauvegarde donc chaque générateur à plusieurs moments de son entraînement, ce qui donne une vingtaine de couples (ressemblance, utilité) par jeu. J'en regarde la corrélation de rang.
-
-**Hypothèse de départ.** Je m'attends à ce que le VAE reproduise correctement les corrélations, mais lisse les queues de distribution et les zones à plusieurs modes, comme la carte de Californie. Il pourrait alors paraître fidèle selon les métriques de corrélation tout en étant moins utile que le modèle de diffusion.
-
-## Avancement
-
-- [x] Préparation des données
-- [ ] Modèles de référence sur données réelles
-- [ ] Modèle de diffusion
-- [ ] VAE conditionnel
-- [ ] Évaluation
-- [ ] Résultats et limites
-
-## Organisation du dépôt
+## Les fichiers
 
 ```
-data_loading.ipynb   chargement, nettoyage, figures, découpage train / val / test
-baseline.ipynb       modèles de référence entraînés sur données réelles
-figures/             figures de référence sur les données réelles
-data/                non versionné, régénéré par data_loading.ipynb
+data_loading.ipynb     chargement, nettoyage, figures, découpage
+baseline_model.ipynb   modèles entraînés sur les vraies données (la référence)
+ddpm.ipynb             le modèle de diffusion, California puis MAGIC
+figures/               les figures
 ```
 
-Pour reproduire : Python 3.12 avec pandas, scikit-learn, matplotlib et PyTorch, puis exécuter `data_loading.ipynb`, qui télécharge les deux jeux.
+Les dossiers `data/` et `checkpoints/` ne sont pas dans le dépôt : tout se régénère avec les notebooks.
+
+Pour relancer, il faut Python 3.12 avec pandas, scikit-learn, scipy, matplotlib et PyTorch, puis exécuter les notebooks dans l'ordre ci-dessus.
